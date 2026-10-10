@@ -106,6 +106,11 @@ ROS_DOMAIN_ID=30 ros2 run mirobot_order_delivery simulate_order --id 1 --red 1 -
 ```
 
 같은 시리얼 포트를 사용하는 다른 드라이버는 함께 실행하지 않는다.
+펌프 명령·설정된 이동 완료 대기·마지막 관측 위치 복귀가 실패하면 후속 이동과 주문 성공 응답을 중단한다.
+실패 원인과 이미 처리한 수량은 `/robot/status`로 알리며, `task.publish_failed_done: true`이면 `/robot/done`에도 `ok: false`로 알린다.
+실패·중단 시 자동 복귀나 무조건적인 흡착 해제를 수행하지 않으므로 작업물과 로봇 상태를 확인한 뒤 복구한다.
+`motion.use_m400`과 `motion.use_status_wait`는 기본 false를 유지하며, 둘 다 끈 경우의 정착 시간 대기는 실제 완료 확인을 대신하지 않는다.
+지원 여부를 확인한 완료 대기 방식을 켠 경우 응답 실패와 시간 초과를 작업 실패로 처리한다.
 
 ## 참고 목록
 

@@ -63,6 +63,7 @@ class MirobotGCode:
     """
 
     def __init__(self, cfg: RobotConfig, logger=None):
+        self.last_error = ""
         self.cfg = cfg
         self.logger = logger
         self.ser: Optional[serial.Serial] = None
@@ -167,30 +168,44 @@ class MirobotGCode:
         self.connect()
         _ = self.rx_all(0.2)
         for cmd in ("M21", "M20", "G90"):
-            self.send_and_wait(cmd, 1.5, warn_only=True)
-        self.send_and_wait("M50", 2.0, warn_only=True)
+            if not self.send_and_wait(cmd, 1.5):
+                raise RuntimeError(f"robot initialization failed: {cmd}")
+        if not self.send_and_wait("M50", 2.0):
+            raise RuntimeError("robot initialization failed: M50")
 
-    def wait_motion_done(self, timeout: Optional[float] = None) -> None:
+    def wait_motion_done(self, timeout: Optional[float] = None, *, should_stop=None) -> bool:
+        should_stop = should_stop or (lambda: False)
         timeout = float(timeout if timeout is not None else self.cfg.status_wait_timeout_s)
+        if should_stop():
+            return self.fail('stopped before motion wait')
         if self.cfg.use_m400:
-            self.send_and_wait("M400", timeout, warn_only=True)
-            return
-
+            if not self.send_and_wait("M400", timeout):
+                return self.fail('M400 completion acknowledgement failed')
+            return not should_stop()
         if self.cfg.use_status_wait:
-            t0 = time.time()
-            got_status = False
-            while time.time() - t0 < timeout:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if should_stop():
+                    return self.fail('stopped during motion wait')
                 ok, state, _xyz, _rpy, _raw = self.query_status_pose(log_tx=False)
-                if ok:
-                    got_status = True
-                    if str(state).strip().lower() == "idle":
-                        time.sleep(max(0.0, float(self.cfg.motion_settle_s)))
-                        return
+                if not ok:
+                    return self.fail('motion status query failed')
+                state = str(state).strip().lower()
+                if state == "idle":
+                    time.sleep(max(0.0, float(self.cfg.motion_settle_s)))
+                    return not should_stop()
+                if state not in {'run', 'busy', 'jog', 'home'}:
+                    return self.fail(f'motion status does not confirm completion: {state}')
                 time.sleep(0.10)
-            if got_status:
-                self.log("warn", f"status wait timed out after {timeout:.1f}s")
-
+            return self.fail(f'motion status wait timed out after {timeout:.1f}s')
+        # Original settle-only mode is retained; it provides no measured completion.
         time.sleep(max(0.0, float(self.cfg.motion_settle_s)))
+        return not should_stop()
+
+    def fail(self, reason: str) -> bool:
+        self.last_error = reason
+        self.log('error', reason)
+        return False
 
     def move_xyz(self, x: float, y: float, z: float, *, feed: Optional[float] = None, timeout: Optional[float] = None) -> bool:
         raw = (float(x), float(y), float(z))
@@ -208,10 +223,6 @@ class MirobotGCode:
         return self.send_and_wait("M3S0", 2.0, warn_only=True)
 
     def emergency_soft_stop(self) -> None:
-        try:
-            self.pump_off()
-        except Exception:
-            pass
         try:
             self.send_and_wait("M0", 1.0, warn_only=True)
         except Exception:
@@ -254,6 +265,7 @@ class MirobotGCode:
         n_points: int = 30,
         should_stop: Callable[[], bool] | None = None,
     ) -> bool:
+        self.last_error = ""
         should_stop = should_stop or (lambda: False)
         feed = float(feed if feed is not None else self.cfg.default_feed)
         (x_pick, y_pick, z_pick), pick_changed = clamp_xyz_report(*pick_xyz, self.cfg.bounds)
@@ -272,24 +284,29 @@ class MirobotGCode:
         def guarded_move(p: Vec3, timeout_s: float = 12.0) -> bool:
             if should_stop():
                 self.log("warn", "stop requested before move")
-                return False
-            return self.move_xyz(*p, feed=feed, timeout=timeout_s)
+                return self.fail("stopped before move")
+            if not self.move_xyz(*p, feed=feed, timeout=timeout_s):
+                return self.fail("move command failed")
+            return True
 
         if not guarded_move(p_pick_top):
             return False
-        self.wait_motion_done()
+        if not self.wait_motion_done(should_stop=should_stop):
+            return False
         if not guarded_move((x_pick, y_pick, z_pick), timeout_s=8.0):
             return False
-        self.wait_motion_done()
+        if not self.wait_motion_done(should_stop=should_stop):
+            return False
         if should_stop():
             return False
-        self.pump_on()
+        if not self.pump_on():
+            return self.fail("pump_on command failed")
         time.sleep(max(0.0, float(self.cfg.pump_dwell_s)))
 
         if not guarded_move(p_pick_top, timeout_s=8.0):
-            self.pump_off()
             return False
-        self.wait_motion_done()
+        if not self.wait_motion_done(should_stop=should_stop):
+            return False
 
         path = make_bezier_arc(
             p_pick_top,
@@ -302,19 +319,24 @@ class MirobotGCode:
         )
         for p in path[1:]:
             if not guarded_move(p, timeout_s=8.0):
-                self.pump_off()
                 return False
             time.sleep(0.005)
-        self.wait_motion_done()
+        if not self.wait_motion_done(should_stop=should_stop):
+            return False
 
         if not guarded_move((x_place, y_place, z_place), timeout_s=8.0):
-            self.pump_off()
             return False
-        self.wait_motion_done()
+        if not self.wait_motion_done(should_stop=should_stop):
+            return False
         time.sleep(max(0.0, float(self.cfg.drop_dwell_s)))
-        self.pump_off()
+        if should_stop():
+            return self.fail("stopped before pump_off")
+        if not self.pump_off():
+            return self.fail("pump_off command failed")
         time.sleep(0.1)
 
-        ok = guarded_move(p_place_top, timeout_s=8.0)
-        self.wait_motion_done()
-        return ok
+        if not guarded_move(p_place_top, timeout_s=8.0):
+            return False
+        if not self.wait_motion_done(should_stop=should_stop):
+            return False
+        return True

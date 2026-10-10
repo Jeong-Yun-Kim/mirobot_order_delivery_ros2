@@ -21,6 +21,7 @@ setup(
         (f"share/{package_name}/data", data("data/*")),
     ],
     install_requires=["setuptools"],
+    tests_require=["pytest"],
     zip_safe=True,
     maintainer="student",
     maintainer_email="student@example.com",

@@ -184,6 +184,7 @@ class MirobotOrderDeliveryNode(Node):
 
         self.work_q: "queue.Queue[dict]" = queue.Queue()
         self.stop_event = threading.Event()
+        self.order_cancelled = threading.Event()
         self.shutdown_event = threading.Event()
         self.busy_lock = threading.Lock()
         self.busy = False
@@ -235,6 +236,7 @@ class MirobotOrderDeliveryNode(Node):
         cmd = (msg.data or "").strip().upper()
         if cmd in {"STOP", "ESTOP", "E-STOP", "PAUSE"}:
             self.stop_event.set()
+            self.order_cancelled.set()
             self.publish_status("stopping", note=cmd)
             self.get_logger().warning(f"stop requested: {cmd}")
             try:
@@ -307,67 +309,68 @@ class MirobotOrderDeliveryNode(Node):
             self.publish_status("stopped_before_start", task="fill", order_id=order_id)
             return
 
-        self.ensure_hardware_ready()
-        if not self.robot.move_xyz(*self.observe_xyz, feed=self.robot_cfg.default_feed, timeout=12.0):
-            raise RuntimeError(f"failed to move to observe pose {self.observe_xyz}")
-        self.robot.wait_motion_done()
-
+        self.order_cancelled.clear()
         delivered = {"red": 0, "green": 0, "blue": 0}
-        cube_index = 0
-        sequence = self.build_color_sequence(counts)
-        self.get_logger().info(f"fill sequence for order {order_id}: {sequence}")
 
-        for color in sequence:
-            if self.stop_event.is_set():
-                self.publish_status("stopped", task="fill", order_id=order_id, delivered=delivered)
-                return
+        def cancelled():
+            return (self.stop_event.is_set() or self.shutdown_event.is_set()
+                    or self.order_cancelled.is_set())
 
-            if self.return_to_observe_after_each_cube:
-                if not self.robot.move_xyz(*self.observe_xyz, feed=self.robot_cfg.default_feed, timeout=12.0):
-                    self.publish_status("move_failed", task="fill", order_id=order_id, note="observe pose failed")
-                    return
-                self.robot.wait_motion_done()
-                time.sleep(max(0.0, self.camera_settle_s))
+        def check_stop():
+            if cancelled():
+                raise RuntimeError('order stopped')
 
-            pick_xyz = self.find_pick_pose(color)
-            place_xyz = self.compute_box_pose(cube_index)
-            self.publish_status(
-                "moving_cube",
-                task="fill",
-                order_id=order_id,
-                color=color,
-                pick_xyz=list(pick_xyz),
-                place_xyz=list(place_xyz),
-                cube_index=cube_index,
-            )
+        def observe():
+            check_stop()
+            if not self.robot.move_xyz(*self.observe_xyz, feed=self.robot_cfg.default_feed, timeout=12.0):
+                raise RuntimeError('observe return command failed')
+            if not self.robot.wait_motion_done(should_stop=cancelled):
+                raise RuntimeError('observe return completion failed')
+            check_stop()
 
-            ok = self.robot.pick_and_place(
-                pick_xyz,
-                place_xyz,
-                travel_z=self.travel_z,
-                place_approach_z=self.box_approach_z,
-                feed=self.robot_cfg.default_feed,
-                n_points=self.motion_arc_points,
-                should_stop=self.stop_event.is_set,
-            )
-            if not ok:
-                self.publish_status("move_failed", task="fill", order_id=order_id, color=color, delivered=delivered)
-                if self.publish_failed_done and not self.stop_event.is_set():
-                    self.publish_done("fill", order_id, ok=False, counts=counts, delivered=delivered, note="move failed")
-                return
-
-            delivered[color] += 1
-            cube_index += 1
-            self.stats.delivered_red = delivered["red"]
-            self.stats.delivered_green = delivered["green"]
-            self.stats.delivered_blue = delivered["blue"]
-            self.publish_status("cube_done", task="fill", order_id=order_id, color=color, delivered=delivered)
-
-        if not self.robot.move_xyz(*self.observe_xyz, feed=self.robot_cfg.default_feed, timeout=12.0):
-            self.get_logger().warning(f"final observe move failed: {self.observe_xyz}")
-        self.robot.wait_motion_done()
-        self.publish_done("fill", order_id, ok=True, counts=counts, delivered=delivered)
-        self.publish_status("fill_done", task="fill", order_id=order_id, delivered=delivered)
+        phase = 'initial_observe'
+        try:
+            self.ensure_hardware_ready()
+            observe()
+            sequence = self.build_color_sequence(counts)
+            for cube_index, color in enumerate(sequence):
+                check_stop()
+                phase = 'observe'
+                if self.return_to_observe_after_each_cube:
+                    observe()
+                    time.sleep(max(0.0, self.camera_settle_s))
+                phase = 'pick_and_place'
+                pick_xyz = self.find_pick_pose(color)
+                place_xyz = self.compute_box_pose(cube_index)
+                check_stop()
+                self.publish_status(
+                    "moving_cube", task="fill", order_id=order_id, color=color,
+                    pick_xyz=list(pick_xyz), place_xyz=list(place_xyz), cube_index=cube_index)
+                if not self.robot.pick_and_place(
+                    pick_xyz, place_xyz, travel_z=self.travel_z,
+                    place_approach_z=self.box_approach_z, feed=self.robot_cfg.default_feed,
+                    n_points=self.motion_arc_points, should_stop=cancelled,
+                ):
+                    raise RuntimeError(self.robot.last_error or 'pick_and_place failed')
+                check_stop()
+                delivered[color] += 1
+                self.stats.delivered_red = delivered['red']
+                self.stats.delivered_green = delivered['green']
+                self.stats.delivered_blue = delivered['blue']
+                self.publish_status('cube_done', task='fill', order_id=order_id,
+                                    color=color, delivered=dict(delivered))
+            phase = 'final_return'
+            observe()
+        except Exception as exc:
+            state = 'stopped' if cancelled() else 'failed'
+            self.publish_status(state, task='fill', order_id=order_id, ok=False,
+                                phase=phase, counts=counts, delivered=dict(delivered), note=str(exc))
+            if self.publish_failed_done:
+                self.publish_done('fill', order_id, ok=False, phase=phase, counts=counts,
+                                  delivered=dict(delivered), note=str(exc))
+            return
+        self.publish_done('fill', order_id, ok=True, counts=counts, delivered=delivered)
+        self.publish_status('fill_done', task='fill', order_id=order_id, delivered=delivered)
 
     def extract_counts(self, order: dict) -> Dict[str, int]:
         result: Dict[str, int] = {}
@@ -547,10 +550,8 @@ class MirobotOrderDeliveryNode(Node):
 
     def destroy_node(self):
         self.shutdown_event.set()
-        try:
-            self.robot.pump_off()
-        except Exception:
-            pass
+        self.stop_event.set()
+        self.worker.join(timeout=max(15.0, self.robot_cfg.command_timeout_s + 2.0))
         try:
             self.robot.close()
         except Exception:
