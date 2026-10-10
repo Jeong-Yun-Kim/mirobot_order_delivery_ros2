@@ -1,0 +1,9 @@
+# YOLOv5's own requirements must also be installed in the same environment.
+numpy<2
+pyserial
+opencv-python<4.12
+torch
+torchvision
+pandas
+PyYAML
+onnxruntime
